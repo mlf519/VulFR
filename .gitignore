@@ -13,6 +13,9 @@ target/
 .springBeans
 .sts4-cache
 
+# 忽略项目任何位置出现的 .trae 文件夹及其所有内容
+.trae/
+
 ### IntelliJ IDEA ###
 .idea
 *.iws

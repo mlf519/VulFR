@@ -1,9 +1,6 @@
 package org.mcc.vulfr.service;
 
 import com.github.dockerjava.api.DockerClient;
-import com.github.dockerjava.api.command.CreateContainerResponse;
-import com.github.dockerjava.api.command.InspectContainerResponse;
-import com.github.dockerjava.api.model.*;
 import org.mcc.vulfr.entity.VulnEnvironment;
 import org.mcc.vulfr.repository.VulnEnvironmentRepository;
 import org.slf4j.Logger;
@@ -18,6 +15,8 @@ import java.io.InputStreamReader;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
@@ -28,6 +27,7 @@ public class VulnEnvironmentService {
     private static final Logger logger = LoggerFactory.getLogger(VulnEnvironmentService.class);
     private static final int PORT_MIN = 10000;
     private static final int PORT_MAX = 12000;
+    private static final int VERIFICATION_TIMEOUT_SECONDS = 60;
 
     private final VulnEnvironmentRepository repository;
     private final DockerClient dockerClient;
@@ -198,7 +198,7 @@ public class VulnEnvironmentService {
         VulnEnvironment env = repository.findById(id)
                 .orElseThrow(() -> new IllegalArgumentException("未找到ID为 " + id + " 的靶场环境"));
 
-        if ("running".equals(env.getStatus())) {
+        if ("running".equals(env.getStatus()) || "starting".equals(env.getStatus())) {
             return env;
         }
 
@@ -217,55 +217,72 @@ public class VulnEnvironmentService {
             throw new IllegalStateException("靶场目录不存在: " + envDir.getAbsolutePath());
         }
 
-        boolean started = false;
-        String errorMessage = "";
+        try {
+            boolean composeStarted = startWithDockerCompose(envDir);
+            if (!composeStarted) {
+                throw new RuntimeException("Docker Compose 启动失败");
+            }
+
+            env.setStatus("starting");
+            env.setContainerId("docker-compose");
+            return repository.save(env);
+        } catch (Exception e) {
+            logger.error("启动靶场失败: {}", e.getMessage());
+            throw new RuntimeException("启动靶场失败: " + e.getMessage(), e);
+        }
+    }
+
+    public boolean verifyAccessUrl(Long id) {
+        VulnEnvironment env = repository.findById(id)
+                .orElseThrow(() -> new IllegalArgumentException("未找到ID为 " + id + " 的靶场环境"));
+
+        String accessUrlsRaw = env.getAccessUrls();
+        logger.info("环境 {} 的 accessUrls 原始值: {}", id, accessUrlsRaw);
+        
+        String firstAccessUrl = getFirstAccessUrl(env);
+        logger.info("解析后的第一个访问链接: {}", firstAccessUrl);
+        
+        if (firstAccessUrl == null || firstAccessUrl.isEmpty()) {
+            logger.info("访问链接为空，直接返回true");
+            return true;
+        }
 
         try {
-            started = startWithDockerCompose(envDir);
-            if (started) {
-                logger.info("Docker Compose启动成功");
-                env.setStatus("running");
-                env.setContainerId("docker-compose");
-                return repository.save(env);
-            }
-        } catch (Exception e) {
-            errorMessage = "Docker Compose 启动失败: " + e.getMessage();
-            logger.warn(errorMessage);
-        }
+            URL url = new URL(firstAccessUrl);
+            logger.info("正在访问: {}:{}", url.getHost(), url.getPort());
+            
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setConnectTimeout(3000);
+            connection.setReadTimeout(3000);
+            connection.setRequestMethod("GET");
+            connection.setInstanceFollowRedirects(true);
 
-        if (!started) {
-            logger.info("Docker Compose失败，尝试备选Docker方案...");
-            try {
-                String containerId = startWithAlternativeDocker(envDir);
-                if (containerId != null) {
-                    logger.info("备选Docker方案启动成功");
-                    env.setStatus("running");
-                    env.setContainerId(containerId);
-                    return repository.save(env);
-                }
-            } catch (Exception e) {
-                errorMessage = "备选Docker方案启动失败: " + e.getMessage();
-                logger.error(errorMessage);
+            int responseCode = connection.getResponseCode();
+            logger.info("HTTP响应状态码: {}", responseCode);
+            
+            if (responseCode >= 200 && responseCode < 400) {
+                logger.info("验证成功!");
+                return true;
+            } else {
+                logger.warn("验证失败，HTTP状态码: {}", responseCode);
+                return false;
             }
+        } catch (IOException e) {
+            logger.error("验证访问链接失败: {}", e.getMessage());
+            return false;
         }
+    }
 
-        if (!started) {
-            logger.info("所有Docker方案失败，尝试本地Java启动...");
-            try {
-                started = startWithJavaJar(envDir);
-                if (started) {
-                    logger.info("本地Java启动成功");
-                    env.setStatus("running");
-                    env.setContainerId("local-java");
-                    return repository.save(env);
-                }
-            } catch (Exception e) {
-                errorMessage = "本地Java启动失败: " + e.getMessage();
-                logger.error(errorMessage);
-            }
+    @Transactional
+    public VulnEnvironment markAsRunning(Long id) {
+        VulnEnvironment env = repository.findById(id)
+                .orElseThrow(() -> new IllegalArgumentException("未找到ID为 " + id + " 的靶场环境"));
+
+        if ("starting".equals(env.getStatus())) {
+            env.setStatus("running");
+            return repository.save(env);
         }
-
-        throw new RuntimeException("启动靶场失败: " + errorMessage);
+        return env;
     }
 
     @Transactional
@@ -285,18 +302,18 @@ public class VulnEnvironmentService {
         File envDir = resolvePath(envPath);
 
         try {
-            boolean stopped = stopWithScript(envDir);
+            boolean stopped = stopWithDockerCompose(envDir);
             if (stopped) {
                 logger.info("靶场停止成功");
                 env.setStatus("stopped");
                 env.setContainerId(null);
                 return repository.save(env);
             } else {
-                throw new RuntimeException("停止脚本执行失败");
+                throw new RuntimeException("Docker Compose 停止失败");
             }
         } catch (Exception e) {
-            logger.error("停止脚本执行异常: {}", e.getMessage());
-            throw new RuntimeException("停止靶场失败: " + e.getMessage());
+            logger.error("停止靶场失败: {}", e.getMessage());
+            throw new RuntimeException("停止靶场失败: " + e.getMessage(), e);
         }
     }
 
@@ -337,214 +354,7 @@ public class VulnEnvironmentService {
         }
     }
 
-    private boolean startWithScript(File envDir) {
-        String os = System.getProperty("os.name").toLowerCase();
-        String scriptName;
-
-        if (os.contains("win")) {
-            scriptName = "start.bat";
-        } else if (os.contains("mac")) {
-            scriptName = "start-mac.sh";
-        } else {
-            scriptName = "start.sh";
-        }
-
-        File scriptFile = new File(envDir, scriptName);
-        if (!scriptFile.exists()) {
-            logger.warn("Startup script not found: {}", scriptFile.getAbsolutePath());
-            return startWithJavaJar(envDir);
-        }
-
-        try {
-            ProcessBuilder pb;
-            if (os.contains("win")) {
-                pb = new ProcessBuilder("cmd.exe", "/c", scriptName);
-            } else {
-                pb = new ProcessBuilder("sh", scriptName);
-            }
-            pb.directory(envDir);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            StringBuilder output = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), "UTF-8"))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                    logger.debug("script: {}", line);
-                }
-            }
-
-            boolean finished = process.waitFor(120, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                logger.error("Startup script timeout");
-                return startWithJavaJar(envDir);
-            }
-
-            if (process.exitValue() == 0) {
-                logger.info("Startup script executed successfully");
-                return true;
-            } else {
-                logger.error("Startup script failed with exit code: {}", process.exitValue());
-                logger.error("Output: {}", output);
-                return startWithJavaJar(envDir);
-            }
-        } catch (Exception e) {
-            logger.error("Failed to run startup script: {}, trying direct Java execution", e.getMessage());
-            return startWithJavaJar(envDir);
-        }
-    }
-
-    private String startWithAlternativeDocker(File envDir) {
-        try {
-            logger.info("Trying alternative Docker approach...");
-            
-            String envPath = envDir.getAbsolutePath();
-            String containerName = "vulfr-" + System.currentTimeMillis();
-            
-            ProcessBuilder pb = new ProcessBuilder(
-                "docker", "run", "-d",
-                "--name", containerName,
-                "-p", "28083:8080",
-                "-e", "SPRING_DATASOURCE_URL=jdbc:mysql://host.docker.internal:13306/my_blog_db?useUnicode=true&characterEncoding=utf8&autoReconnect=true&useSSL=false&serverTimezone=UTC",
-                "-e", "SPRING_DATASOURCE_USERNAME=root",
-                "-e", "SPRING_DATASOURCE_PASSWORD=519666",
-                "-v", envPath + "/My-Blog-master/target:/app",
-                "openjdk:11-jre-slim",
-                "java", "-jar", "/app/my-blog-4.0.0-SNAPSHOT.jar"
-            );
-            pb.redirectErrorStream(true);
-            
-            Process process = pb.start();
-            
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            StringBuilder output = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                output.append(line);
-            }
-            
-            process.waitFor(30, TimeUnit.SECONDS);
-            
-            if (process.exitValue() == 0 && output.length() > 0) {
-                String containerId = output.toString().trim();
-                logger.info("Alternative Docker started successfully, container ID: {}", containerId);
-                Thread.sleep(15000);
-                return containerId;
-            } else {
-                logger.error("Alternative Docker failed with exit code: {}", process.exitValue());
-                return null;
-            }
-        } catch (Exception e) {
-            logger.error("Failed to start with alternative Docker: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    private boolean startWithJavaJar(File envDir) {
-        try {
-            logger.info("Trying direct Java JAR execution...");
-            
-            File myBlogDir = new File(envDir, "My-Blog-master");
-            File jarFile = new File(myBlogDir, "target/my-blog-4.0.0-SNAPSHOT.jar");
-            
-            if (!jarFile.exists()) {
-                logger.error("JAR file not found: {}", jarFile.getAbsolutePath());
-                return false;
-            }
-
-            logger.info("Local MySQL detected, connecting directly...");
-
-            ProcessBuilder pb = new ProcessBuilder("java", "-jar", "target/my-blog-4.0.0-SNAPSHOT.jar");
-            pb.directory(myBlogDir);
-            pb.redirectErrorStream(true);
-            
-            Process process = pb.start();
-
-            new Thread(() -> {
-                try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), "UTF-8"))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        logger.info("app: {}", line);
-                    }
-                } catch (Exception e) {
-                    logger.error("Error reading app output: {}", e.getMessage());
-                }
-            }).start();
-
-            Thread.sleep(10000);
-            
-            if (process.isAlive()) {
-                logger.info("Application started successfully via Java JAR");
-                return true;
-            } else {
-                logger.error("Application process died");
-                return false;
-            }
-        } catch (Exception e) {
-            logger.error("Failed to start with Java JAR: {}", e.getMessage());
-            return false;
-        }
-    }
-
-    private boolean stopWithScript(File envDir) {
-        String os = System.getProperty("os.name").toLowerCase();
-        String scriptName;
-
-        if (os.contains("win")) {
-            scriptName = "stop.bat";
-        } else {
-            scriptName = "stop.sh";
-        }
-
-        File scriptFile = new File(envDir, scriptName);
-        if (!scriptFile.exists()) {
-            logger.warn("停止脚本不存在: {}, 尝试直接使用docker-compose down", scriptFile.getAbsolutePath());
-            return stopWithDockerComposeFallback(envDir);
-        }
-
-        try {
-            ProcessBuilder pb;
-            if (os.contains("win")) {
-                pb = new ProcessBuilder("cmd.exe", "/c", scriptName);
-            } else {
-                pb = new ProcessBuilder("sh", scriptName);
-            }
-            pb.directory(envDir);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-
-            StringBuilder output = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line).append("\n");
-                    logger.debug("停止脚本: {}", line);
-                }
-            }
-
-            boolean finished = process.waitFor(60, TimeUnit.SECONDS);
-            if (!finished) {
-                process.destroyForcibly();
-                logger.warn("停止脚本超时，尝试备选方案");
-                return stopWithDockerComposeFallback(envDir);
-            }
-
-            if (process.exitValue() != 0) {
-                logger.warn("停止脚本执行失败，退出码: {}, 尝试备选方案", process.exitValue());
-                return stopWithDockerComposeFallback(envDir);
-            } else {
-                logger.info("停止脚本执行成功");
-                return true;
-            }
-        } catch (Exception e) {
-            logger.error("执行停止脚本异常: {}, 尝试备选方案", e.getMessage());
-            return stopWithDockerComposeFallback(envDir);
-        }
-    }
-
-    private boolean stopWithDockerComposeFallback(File envDir) {
+    private boolean stopWithDockerCompose(File envDir) {
         try {
             ProcessBuilder pb = new ProcessBuilder("docker-compose", "down");
             pb.directory(envDir);
@@ -561,21 +371,81 @@ public class VulnEnvironmentService {
             boolean finished = process.waitFor(60, TimeUnit.SECONDS);
             if (!finished) {
                 process.destroyForcibly();
-                logger.error("Docker Compose停止超时");
+                logger.error("Docker Compose stop timeout");
                 return false;
             }
 
             if (process.exitValue() != 0) {
-                logger.error("Docker Compose停止失败，退出码: {}", process.exitValue());
+                logger.error("Docker Compose stop failed with exit code: {}", process.exitValue());
                 return false;
             }
             
-            logger.info("Docker Compose停止成功");
+            logger.info("Docker Compose stopped successfully");
             return true;
         } catch (Exception e) {
-            logger.error("使用docker-compose停止失败: {}", e.getMessage());
+            logger.error("Failed to stop docker-compose: {}", e.getMessage());
             return false;
         }
+    }
+
+    private String getFirstAccessUrl(VulnEnvironment env) {
+        String accessUrls = env.getAccessUrls();
+        if (accessUrls == null || accessUrls.trim().isEmpty()) {
+            return null;
+        }
+        
+        try {
+            com.fasterxml.jackson.databind.ObjectMapper mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+            java.util.List<java.util.Map<String, String>> urlList = mapper.readValue(
+                accessUrls, 
+                new com.fasterxml.jackson.core.type.TypeReference<java.util.List<java.util.Map<String, String>>>() {}
+            );
+            
+            if (urlList != null && !urlList.isEmpty()) {
+                java.util.Map<String, String> firstUrlMap = urlList.get(0);
+                String urlValue = firstUrlMap.get("value");
+                return urlValue != null && !urlValue.trim().isEmpty() ? urlValue.trim() : null;
+            }
+        } catch (Exception e) {
+            logger.warn("解析 accessUrls JSON 失败: {}", e.getMessage());
+        }
+        
+        return null;
+    }
+
+    private boolean verifyAccessUrl(String urlStr, File envDir) {
+        logger.info("开始验证访问链接: {}, 超时时间: {}秒", urlStr, VERIFICATION_TIMEOUT_SECONDS);
+        
+        for (int i = 0; i < VERIFICATION_TIMEOUT_SECONDS; i++) {
+            try {
+                URL url = new URL(urlStr);
+                HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+                connection.setConnectTimeout(3000);
+                connection.setReadTimeout(3000);
+                connection.setRequestMethod("GET");
+                
+                int responseCode = connection.getResponseCode();
+                if (responseCode >= 200 && responseCode < 400) {
+                    logger.info("访问链接验证成功，HTTP状态码: {}", responseCode);
+                    return true;
+                }
+                
+                logger.debug("验证尝试 {}: HTTP状态码 {}", i + 1, responseCode);
+            } catch (IOException e) {
+                logger.debug("验证尝试 {}: 连接失败 - {}", i + 1, e.getMessage());
+            }
+            
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                logger.warn("验证被中断");
+                return false;
+            }
+        }
+        
+        logger.warn("访问链接验证超时，{}秒内未能成功访问", VERIFICATION_TIMEOUT_SECONDS);
+        return false;
     }
 
     private Integer allocatePort() {
@@ -585,100 +455,5 @@ public class VulnEnvironmentService {
             }
         }
         throw new IllegalStateException("No available ports in range " + PORT_MIN + "-" + PORT_MAX);
-    }
-
-    private boolean verifyStart(VulnEnvironment env, File envDir) {
-        logger.info("Verifying environment startup...");
-        
-        int maxAttempts = 10;
-        int delayMs = 3000;
-        
-        for (int i = 0; i < maxAttempts; i++) {
-            try {
-                Thread.sleep(delayMs);
-                
-                if (isDockerContainerRunning(envDir)) {
-                    logger.info("Docker container is running");
-                    return true;
-                }
-                
-                if (isLocalPortListening(28083)) {
-                    logger.info("Local port 28083 is listening");
-                    return true;
-                }
-                
-                logger.debug("Verification attempt {} failed, retrying...", i + 1);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
-        }
-        
-        logger.warn("Startup verification failed after {} attempts", maxAttempts);
-        return false;
-    }
-
-    private boolean verifyStop(VulnEnvironment env, File envDir) {
-        logger.info("Verifying environment stop...");
-        
-        int maxAttempts = 5;
-        int delayMs = 2000;
-        
-        for (int i = 0; i < maxAttempts; i++) {
-            try {
-                Thread.sleep(delayMs);
-                
-                if (!isDockerContainerRunning(envDir) && !isLocalPortListening(28083)) {
-                    logger.info("Environment stopped successfully");
-                    return true;
-                }
-                
-                logger.debug("Stop verification attempt {} failed, retrying...", i + 1);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return false;
-            }
-        }
-        
-        logger.warn("Stop verification failed after {} attempts", maxAttempts);
-        return false;
-    }
-
-    private boolean isDockerContainerRunning(File envDir) {
-        try {
-            ProcessBuilder pb = new ProcessBuilder("docker-compose", "ps", "-q");
-            pb.directory(envDir);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-            
-            String output = new BufferedReader(new InputStreamReader(process.getInputStream())).readLine();
-            process.waitFor();
-            
-            return output != null && !output.isEmpty();
-        } catch (Exception e) {
-            logger.debug("Error checking Docker containers: {}", e.getMessage());
-            return false;
-        }
-    }
-
-    private boolean isLocalPortListening(int port) {
-        try {
-            ProcessBuilder pb = new ProcessBuilder("netstat", "-ano");
-            Process process = pb.start();
-            
-            StringBuilder output = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    output.append(line);
-                }
-            }
-            process.waitFor();
-            
-            return output.toString().contains(":" + port + " ");
-        } catch (Exception e) {
-            logger.debug("Error checking port: {}", e.getMessage());
-            return false;
-        }
     }
 }

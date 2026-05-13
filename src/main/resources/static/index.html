@@ -163,6 +163,17 @@
             color: #dc2626;
         }
         
+        .status-starting {
+            background: #fef3c7;
+            color: #d97706;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.6; }
+        }
+        
         .modal-overlay {
             display: none;
             position: fixed;
@@ -529,17 +540,19 @@
                     <td>${renderAccessUrls(env.accessUrls)}</td>
                     <td><span class="status-badge status-${env.status.toLowerCase()}">${env.status}</span></td>
                     <td>
-                        <div style="display: flex; gap: 5px; flex-wrap: nowrap; align-items: center;">
-                            ${env.status === 'stopped' ? `
-                                <button class="btn btn-success" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="startEnvironment(${env.id})">启动</button>
-                            ` : `
-                                <button class="btn btn-warning" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="stopEnvironment(${env.id})">停止</button>
-                            `}
-                            <button class="btn btn-primary" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="showEditModal(${env.id})">编辑</button>
-                            <button class="btn btn-info" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="duplicateEnvironment(${env.id})">复制</button>
-                            <button class="btn btn-danger" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="deleteEnvironment(${env.id})">删除</button>
-                        </div>
-                    </td>
+                            <div style="display: flex; gap: 5px; flex-wrap: nowrap; align-items: center;">
+                                ${env.status === 'stopped' ? `
+                                    <button class="btn btn-success" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="startEnvironment(${env.id})">启动</button>
+                                ` : env.status === 'starting' ? `
+                                    <button class="btn btn-warning" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" disabled>启动中...</button>
+                                ` : `
+                                    <button class="btn btn-warning" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="stopEnvironment(${env.id})">停止</button>
+                                `}
+                                <button class="btn btn-primary" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="showEditModal(${env.id})">编辑</button>
+                                <button class="btn btn-info" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="duplicateEnvironment(${env.id})">复制</button>
+                                <button class="btn btn-danger" style="padding: 5px 10px; font-size: 12px; white-space: nowrap;" onclick="deleteEnvironment(${env.id})">删除</button>
+                            </div>
+                        </td>
                 </tr>
             `).join('');
             
@@ -765,31 +778,46 @@
             try {
                 const response = await fetch(`${API_URL}/${id}/start`, { method: 'POST' });
                 if (response.ok) {
-                    const result = await response.json();
-                    
                     button.textContent = '验证中...';
                     
-                    const accessUrls = result.accessUrls ? JSON.parse(result.accessUrls) : [];
-                    if (accessUrls.length > 0) {
-                        const firstUrl = accessUrls[0].value;
-                        const isAccessible = await checkUrlAccessibility(firstUrl);
-                        if (isAccessible) {
-                            showToast('启动成功!', 'success');
-                        } else {
-                            showToast('验证失败，正在关闭环境...', 'warning');
-                            
-                            try {
-                                await fetch(`${API_URL}/${id}/stop`, { method: 'POST' });
-                                showToast('启动失败，已自动关闭环境', 'error');
-                            } catch (stopError) {
-                                showToast('启动失败，关闭环境时发生错误: ' + stopError.message, 'error');
-                            }
-                        }
-                    } else {
-                        showToast('启动成功!', 'success');
-                    }
+                    let verifyInterval;
+                    let verifyCount = 0;
+                    const maxVerifies = 60;
                     
-                    loadEnvironments();
+                    verifyInterval = setInterval(async () => {
+                        verifyCount++;
+                        console.log(`验证中... (${verifyCount}/${maxVerifies})`);
+                        
+                        try {
+                            const verifyResponse = await fetch(`${API_URL}/${id}/verify`);
+                            if (verifyResponse.ok) {
+                                const verified = await verifyResponse.json();
+                                
+                                if (verified) {
+                                    clearInterval(verifyInterval);
+                                    await fetch(`${API_URL}/${id}/mark-running`, { method: 'POST' });
+                                    showToast('启动成功!', 'success');
+                                    button.textContent = '启动成功';
+                                    setTimeout(() => {
+                                        loadEnvironments();
+                                    }, 500);
+                                    return;
+                                }
+                            }
+                        } catch (e) {
+                            console.log('验证失败:', e);
+                        }
+                        
+                        if (verifyCount >= maxVerifies) {
+                            clearInterval(verifyInterval);
+                            showToast('启动超时，服务未在60秒内响应', 'error');
+                            await fetch(`${API_URL}/${id}/stop`, { method: 'POST' });
+                            button.textContent = originalText;
+                            button.disabled = false;
+                            button.style.opacity = '1';
+                            loadEnvironments();
+                        }
+                    }, 1000);
                 } else {
                     let errorMessage = '未知错误';
                     try {
@@ -803,57 +831,7 @@
                 }
             } catch (error) {
                 showToast('启动失败: ' + (error.message || '网络错误'), 'error');
-            } finally {
-                button.textContent = originalText;
-                button.disabled = false;
-                button.style.opacity = '1';
             }
-        }
-        
-        async function checkUrlAccessibility(url) {
-            const maxAttempts = 40;
-            const delayMs = 1000;
-            
-            for (let i = 0; i < maxAttempts; i++) {
-                console.log(`Attempt ${i + 1}/40 to access: ${url}`);
-                try {
-                    const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 5000);
-                    
-                    let response;
-                    try {
-                        response = await fetch(url, { 
-                            method: 'HEAD', 
-                            signal: controller.signal,
-                            mode: 'no-cors'
-                        });
-                    } catch (headError) {
-                        console.log('HEAD request failed, trying GET...');
-                        response = await fetch(url, { 
-                            method: 'GET', 
-                            signal: controller.signal,
-                            mode: 'no-cors'
-                        });
-                    }
-                    
-                    clearTimeout(timeoutId);
-                    
-                    if (response.type === 'opaque') {
-                        console.log('Opaque response received (CORS restricted), assuming accessible');
-                        return true;
-                    }
-                    
-                    if (response.ok || response.status === 401 || response.status === 403) {
-                        console.log(`Success! Status: ${response.status}`);
-                        return true;
-                    }
-                } catch (error) {
-                    console.log(`Attempt ${i + 1} to access ${url} failed:`, error.message);
-                }
-                await new Promise(resolve => setTimeout(resolve, delayMs));
-            }
-            console.log(`All ${maxAttempts} attempts failed, returning false`);
-            return false;
         }
         
         async function stopEnvironment(id) {

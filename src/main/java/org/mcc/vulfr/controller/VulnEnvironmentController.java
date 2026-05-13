@@ -15,7 +15,7 @@ import java.util.List;
 
 @RestController
 @RequestMapping("/api/environments")
-@CrossOrigin(origins = "http://localhost:8082", maxAge = 3600)
+@CrossOrigin(origins = "*", maxAge = 3600)
 public class VulnEnvironmentController {
 
     private final VulnEnvironmentService service;
@@ -90,5 +90,15 @@ public class VulnEnvironmentController {
     @PostMapping("/{id}/stop")
     public ResponseEntity<VulnEnvironment> stopEnvironment(@PathVariable Long id) {
         return ResponseEntity.ok(service.stopEnvironment(id));
+    }
+
+    @GetMapping("/{id}/verify")
+    public ResponseEntity<Boolean> verifyEnvironment(@PathVariable Long id) {
+        return ResponseEntity.ok(service.verifyAccessUrl(id));
+    }
+
+    @PostMapping("/{id}/mark-running")
+    public ResponseEntity<VulnEnvironment> markAsRunning(@PathVariable Long id) {
+        return ResponseEntity.ok(service.markAsRunning(id));
     }
 }
