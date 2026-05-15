@@ -101,4 +101,19 @@ public class VulnEnvironmentController {
     public ResponseEntity<VulnEnvironment> markAsRunning(@PathVariable Long id) {
         return ResponseEntity.ok(service.markAsRunning(id));
     }
+
+    @PostMapping("/{id}/package")
+    public ResponseEntity<?> packageEnvironment(@PathVariable Long id) {
+        return ResponseEntity.ok(service.startPackage(id));
+    }
+
+    @GetMapping("/{id}/package/status")
+    public ResponseEntity<?> getPackageStatus(@PathVariable Long id) {
+        return ResponseEntity.ok(service.getPackageStatus(id));
+    }
+
+    @GetMapping("/{id}/package/check")
+    public ResponseEntity<?> checkPackageExists(@PathVariable Long id) {
+        return ResponseEntity.ok(service.checkPackageExists(id));
+    }
 }

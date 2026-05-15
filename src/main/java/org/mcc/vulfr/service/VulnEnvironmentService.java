@@ -11,6 +11,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.InputStreamReader;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -18,6 +19,7 @@ import org.springframework.data.domain.Pageable;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
@@ -28,6 +30,26 @@ public class VulnEnvironmentService {
     private static final int PORT_MIN = 10000;
     private static final int PORT_MAX = 12000;
     private static final int VERIFICATION_TIMEOUT_SECONDS = 60;
+    private static final int PACKAGE_TIMEOUT_SECONDS = 180; // 3分钟打包超时
+
+    // 打包状态存储
+    private final java.util.Map<Long, PackageStatus> packageStatusMap = new java.util.concurrent.ConcurrentHashMap<>();
+    
+    // 打包状态内部类
+    private static class PackageStatus {
+        volatile boolean running;
+        volatile boolean completed;
+        volatile boolean success;
+        volatile String message;
+        volatile String jarPath;
+        
+        PackageStatus() {
+            this.running = true;
+            this.completed = false;
+            this.success = false;
+            this.message = "打包中...";
+        }
+    }
 
     private final VulnEnvironmentRepository repository;
     private final DockerClient dockerClient;
@@ -215,6 +237,11 @@ public class VulnEnvironmentService {
         File envDir = resolvePath(envPath);
         if (!envDir.exists()) {
             throw new IllegalStateException("靶场目录不存在: " + envDir.getAbsolutePath());
+        }
+
+        // 检查是否已经打包
+        if (!isJarPackageExists(id)) {
+            throw new IllegalStateException("项目未打包，请先进行打包操作");
         }
 
         try {
@@ -455,5 +482,307 @@ public class VulnEnvironmentService {
             }
         }
         throw new IllegalStateException("No available ports in range " + PORT_MIN + "-" + PORT_MAX);
+    }
+
+    private boolean isJarPackageExists(Long id) {
+        VulnEnvironment env = repository.findById(id)
+                .orElseThrow(() -> new IllegalArgumentException("未找到ID为 " + id + " 的靶场环境"));
+
+        String envPath = env.getPath();
+        if (envPath == null || envPath.isEmpty()) {
+            return false;
+        }
+
+        File envDir = resolvePath(envPath);
+        if (!envDir.exists()) {
+            return false;
+        }
+
+        File targetDir = envDir;
+        File pomFile = new File(envDir, "pom.xml");
+        
+        if (!pomFile.exists()) {
+            File[] subdirs = envDir.listFiles(File::isDirectory);
+            if (subdirs != null) {
+                for (File subdir : subdirs) {
+                    pomFile = new File(subdir, "pom.xml");
+                    if (pomFile.exists()) {
+                        targetDir = subdir;
+                        break;
+                    }
+                }
+            }
+        }
+
+        File targetFolder = new File(targetDir, "target");
+        if (!targetFolder.exists()) {
+            return false;
+        }
+
+        File[] jarFiles = targetFolder.listFiles((dir, name) -> name.endsWith(".jar") && !name.contains("original"));
+        return jarFiles != null && jarFiles.length > 0;
+    }
+
+    public java.util.Map<String, Object> startPackage(Long id) {
+        java.util.Map<String, Object> result = new java.util.HashMap<>();
+        
+        VulnEnvironment env = repository.findById(id)
+                .orElseThrow(() -> new IllegalArgumentException("未找到ID为 " + id + " 的靶场环境"));
+
+        String envPath = env.getPath();
+        if (envPath == null || envPath.isEmpty()) {
+            result.put("success", false);
+            result.put("message", "靶场路径未配置");
+            return result;
+        }
+
+        File envDir = resolvePath(envPath);
+        if (!envDir.exists()) {
+            result.put("success", false);
+            result.put("message", "靶场目录不存在: " + envDir.getAbsolutePath());
+            return result;
+        }
+
+        // 检查是否正在打包
+        if (packageStatusMap.containsKey(id) && packageStatusMap.get(id).running) {
+            result.put("success", false);
+            result.put("message", "正在打包中，请等待");
+            return result;
+        }
+
+        // 检查是否已经打包
+        if (isJarPackageExists(id)) {
+            result.put("success", true);
+            result.put("alreadyPackaged", true);
+            result.put("message", "项目已打包，可直接启动");
+            return result;
+        }
+
+        // 创建打包状态
+        PackageStatus status = new PackageStatus();
+        packageStatusMap.put(id, status);
+
+        // 异步执行打包
+        new Thread(() -> {
+            try {
+                logger.info("开始查找项目目录，基础路径: {}", envDir.getAbsolutePath());
+                
+                File pomFile = new File(envDir, "pom.xml");
+                File targetDir = envDir;
+                
+                if (!pomFile.exists()) {
+                    // 查找子目录中的 pom.xml
+                    logger.info("当前目录未找到 pom.xml，开始查找子目录...");
+                    File[] subdirs = envDir.listFiles(File::isDirectory);
+                    if (subdirs != null && subdirs.length > 0) {
+                        logger.info("找到 {} 个子目录", subdirs.length);
+                        for (File subdir : subdirs) {
+                            logger.info("检查子目录: {}", subdir.getName());
+                            pomFile = new File(subdir, "pom.xml");
+                            if (pomFile.exists()) {
+                                targetDir = subdir;
+                                logger.info("在子目录中找到 pom.xml: {}", targetDir.getAbsolutePath());
+                                break;
+                            }
+                        }
+                    } else {
+                        logger.warn("未找到任何子目录");
+                    }
+                } else {
+                    logger.info("在当前目录找到 pom.xml: {}", envDir.getAbsolutePath());
+                }
+
+                if (!pomFile.exists()) {
+                    status.completed = true;
+                    status.running = false;
+                    status.success = false;
+                    status.message = "未找到 pom.xml 文件，请确保项目目录配置正确";
+                    logger.error("未找到 pom.xml 文件");
+                    return;
+                }
+
+                logger.info("开始打包项目: {}", targetDir.getAbsolutePath());
+                
+                // 获取操作系统对应的 Maven 命令
+                String osName = System.getProperty("os.name").toLowerCase();
+                String mavenCommand;
+                if (osName.contains("win")) {
+                    mavenCommand = "mvn.cmd";
+                } else {
+                    mavenCommand = "mvn";
+                }
+                
+                ProcessBuilder pb = new ProcessBuilder(mavenCommand, "clean", "package", "-DskipTests", "-q");
+                pb.directory(targetDir);
+                
+                // 设置环境变量，确保 Maven 能找到
+                Map<String, String> processEnv = pb.environment();
+                String mavenHome = System.getenv("MAVEN_HOME");
+                String m2Home = System.getenv("M2_HOME");
+                String path = processEnv.get("PATH");
+                
+                logger.info("Maven环境检查 - MAVEN_HOME: {}, M2_HOME: {}, PATH: {}", mavenHome, m2Home, path != null ? path.substring(0, Math.min(100, path.length())) : "null");
+                
+                // 修复 PATH 为 null 的问题
+                if (path == null || path.isEmpty()) {
+                    path = "";
+                }
+                
+                if (mavenHome != null && !mavenHome.isEmpty()) {
+                    String mavenBin = mavenHome + File.separator + "bin";
+                    if (!path.contains(mavenBin)) {
+                        processEnv.put("PATH", mavenBin + File.pathSeparator + path);
+                    }
+                } else if (m2Home != null && !m2Home.isEmpty()) {
+                    String mavenBin = m2Home + File.separator + "bin";
+                    if (!path.contains(mavenBin)) {
+                        processEnv.put("PATH", mavenBin + File.pathSeparator + path);
+                    }
+                }
+                
+                pb.redirectErrorStream(true);
+                Process process = pb.start();
+
+                if (process == null) {
+                    status.completed = true;
+                    status.running = false;
+                    status.success = false;
+                    status.message = "打包失败: 无法启动 Maven 进程";
+                    logger.error("无法启动 Maven 进程");
+                    return;
+                }
+
+                StringBuilder output = new StringBuilder();
+                try {
+                    InputStream inputStream = process.getInputStream();
+                    if (inputStream == null) {
+                        throw new IOException("Process input stream is null");
+                    }
+                    
+                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            output.append(line).append("\n");
+                            logger.debug("mvn package: {}", line);
+                        }
+                    }
+                } catch (IOException e) {
+                    logger.error("读取打包输出失败: {}", e.getMessage(), e);
+                    throw e;
+                }
+
+                boolean finished = process.waitFor(PACKAGE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                if (!finished) {
+                    process.destroyForcibly();
+                    status.completed = true;
+                    status.running = false;
+                    status.success = false;
+                    status.message = "打包超时（超过3分钟）";
+                    return;
+                }
+
+                if (process.exitValue() == 0) {
+                    // 检查是否生成了jar包
+                    File targetFolder = new File(targetDir, "target");
+                    File[] jarFiles = targetFolder.listFiles((dir, name) -> name.endsWith(".jar") && !name.contains("original"));
+                    
+                    if (jarFiles != null && jarFiles.length > 0) {
+                        status.completed = true;
+                        status.running = false;
+                        status.success = true;
+                        status.message = "打包成功";
+                        status.jarPath = jarFiles[0].getAbsolutePath();
+                        logger.info("项目打包成功，生成的jar包: {}", status.jarPath);
+                    } else {
+                        status.completed = true;
+                        status.running = false;
+                        status.success = false;
+                        status.message = "打包命令执行成功，但未找到生成的jar包";
+                        logger.warn("打包命令成功，但未找到jar包");
+                    }
+                } else {
+                    status.completed = true;
+                    status.running = false;
+                    status.success = false;
+                    
+                    String outputStr = output.toString();
+                    String errorMsg = "打包失败，退出码: " + process.exitValue();
+                    
+                    logger.error("项目打包失败，退出码: {}", process.exitValue());
+                    logger.error("打包输出长度: {}", outputStr.length());
+                    logger.error("打包输出内容: {}", outputStr);
+                    
+                    // 提取Maven错误信息
+                    if (outputStr != null && !outputStr.isEmpty() && outputStr.contains("[ERROR]")) {
+                        String[] lines = outputStr.split("\n");
+                        for (String line : lines) {
+                            if (line.contains("[ERROR]")) {
+                                // 跳过帮助信息
+                                if (line.contains("[Help 1]") || line.contains("[Help 2]") ||
+                                    line.contains("To see the full stack trace") ||
+                                    line.contains("Re-run Maven") ||
+                                    line.contains("For more information")) {
+                                    continue;
+                                }
+                                
+                                String extractedMsg = line.replace("[ERROR]", "").trim();
+                                if (!extractedMsg.isEmpty()) {
+                                    errorMsg = extractedMsg;
+                                    logger.info("提取到的错误信息: {}", errorMsg);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    status.message = errorMsg;
+                }
+            } catch (Exception e) {
+                status.completed = true;
+                status.running = false;
+                status.success = false;
+                String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+                status.message = "打包失败: " + errorMsg;
+                logger.error("打包项目失败: {}", errorMsg, e);
+            }
+        }).start();
+
+        result.put("success", true);
+        result.put("message", "打包任务已启动");
+        return result;
+    }
+
+    public java.util.Map<String, Object> getPackageStatus(Long id) {
+        java.util.Map<String, Object> result = new java.util.HashMap<>();
+        
+        PackageStatus status = packageStatusMap.get(id);
+        
+        if (status == null) {
+            result.put("running", false);
+            result.put("completed", false);
+            result.put("success", false);
+            result.put("message", "未找到打包任务");
+            return result;
+        }
+
+        result.put("running", status.running);
+        result.put("completed", status.completed);
+        result.put("success", status.success);
+        result.put("message", status.message);
+        if (status.jarPath != null) {
+            result.put("jarPath", status.jarPath);
+        }
+
+        return result;
+    }
+
+    public java.util.Map<String, Object> checkPackageExists(Long id) {
+        java.util.Map<String, Object> result = new java.util.HashMap<>();
+        
+        boolean exists = isJarPackageExists(id);
+        result.put("exists", exists);
+        result.put("message", exists ? "项目已打包" : "项目未打包");
+        
+        return result;
     }
 }
